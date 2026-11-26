@@ -165,6 +165,95 @@ def test_security_analysis_params_are_not_modified_and_default_to_the_method_loa
     assert security_params.provider_parameters == {"threadCount": "2", "contingencyPropagation": "true"}
 
 
+def test_run_powsybl_analysis_reports_contingency_voltage_levels(
+    powsybl_bus_breaker_net: pypowsybl.network.Network,
+) -> None:
+    nminus1_definition = get_full_nminus1_definition_powsybl(powsybl_bus_breaker_net)
+    pow_n1_def = translate_nminus1_for_powsybl(nminus1_definition, powsybl_bus_breaker_net)
+    security_params = pypowsybl.security.Parameters(
+        load_flow_parameters=get_cgmes_distributed_slack_parameters(),
+        provider_parameters={"threadCount": "1", "contingencyPropagation": "false"},
+    )
+    reference, _ = run_powsybl_analysis(powsybl_bus_breaker_net, pow_n1_def, security_params, "ac")
+    reference_buses = reference.bus_results.reset_index()
+    voltage_levels = sorted(reference_buses["voltage_level_id"].unique())
+    assert len(voltage_levels) > 2
+    common, extra = voltage_levels[:-1], voltage_levels[-1]
+    outages = [contingency.id for contingency in pow_n1_def.contingencies if contingency.elements]
+    chosen = next(
+        outage
+        for outage in outages
+        if extra in set(reference_buses.loc[reference_buses["contingency_id"] == outage, "voltage_level_id"])
+    )
+
+    pow_n1_def.monitored_elements["voltage_levels"] = common
+    pow_n1_def.contingency_voltage_levels = {chosen: [extra], "BASECASE": [extra], "unknown": [extra]}
+    result, _ = run_powsybl_analysis(powsybl_bus_breaker_net, pow_n1_def, security_params, "ac")
+
+    buses = result.bus_results.reset_index()
+    assert set(buses.loc[buses["voltage_level_id"] == extra, "contingency_id"]) == {chosen}
+    # everything else is reported as without the extra voltage level, also in the chosen contingency
+    expected = reference_buses[
+        (reference_buses["voltage_level_id"] != extra) | (reference_buses["contingency_id"] == chosen)
+    ]
+    columns = ["contingency_id", "voltage_level_id", "bus_id"]
+    pd.testing.assert_frame_equal(
+        buses.sort_values(columns).reset_index(drop=True), expected.sort_values(columns).reset_index(drop=True)
+    )
+    branch_columns = ["contingency_id", "branch_id"]
+    pd.testing.assert_frame_equal(
+        result.branch_results.reset_index().sort_values(branch_columns).reset_index(drop=True),
+        reference.branch_results.reset_index().sort_values(branch_columns).reset_index(drop=True),
+    )
+
+
+def test_run_contingency_analysis_powsybl_limits_monitored_voltage_levels(
+    powsybl_node_breaker_net: pypowsybl.network.Network,
+) -> None:
+    nminus1_definition = get_full_nminus1_definition_powsybl(powsybl_node_breaker_net)
+    reference = run_contingency_analysis_powsybl(
+        powsybl_node_breaker_net, nminus1_definition, job_id="job", timestep=0, method="ac", polars=True
+    )
+    reference_nodes = reference.node_results.collect()
+    bus_voltage_levels = pd.concat(
+        [
+            powsybl_node_breaker_net.get_busbar_sections(attributes=["voltage_level_id"]),
+            powsybl_node_breaker_net.get_bus_breaker_view_buses(attributes=["voltage_level_id"]),
+        ]
+    )["voltage_level_id"]
+    reported = sorted(set(bus_voltage_levels.reindex(reference_nodes["element"].unique().to_list()).dropna()))
+    assert len(reported) > 1
+    kept = reported[:1]
+    kept_elements = bus_voltage_levels.index[bus_voltage_levels.isin(kept)].to_list()
+
+    result = run_contingency_analysis_powsybl(
+        powsybl_node_breaker_net,
+        nminus1_definition,
+        job_id="job",
+        timestep=0,
+        method="ac",
+        polars=True,
+        monitored_voltage_levels=kept,
+    )
+
+    nodes = result.node_results.collect()
+    solved = nodes.filter(pl.col("vm").is_not_nan() & pl.col("vm").is_not_null())
+    assert set(solved["element"].unique().to_list()) <= set(kept_elements)
+    columns = ["contingency", "element"]
+    expected = reference_nodes.filter(pl.col("element").is_in(kept_elements)).sort(columns)
+    assert solved.height
+    assert (
+        solved.sort(columns)
+        .select(columns + ["vm", "va"])
+        .equals(expected.filter(pl.col("vm").is_not_nan() & pl.col("vm").is_not_null()).select(columns + ["vm", "va"]))
+    )
+    assert (
+        result.branch_results.collect()
+        .sort("contingency", "element", "side")
+        .equals(reference.branch_results.collect().sort("contingency", "element", "side"))
+    )
+
+
 def test_powsybl_contingency_analysis_batches_outages_sequentially(
     powsybl_bus_breaker_net: pypowsybl.network.Network,
     mocker,

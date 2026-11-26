@@ -1007,3 +1007,123 @@ def test_translate_element_names():
         "The element_name column should contain the translated name"
     )
     assert (va_diff_df.collect()["element_name"] == "").all(), "Nothing should change in the original dataframe"
+
+
+def _node_results_of_two_busbar_sections(bus_results: pl.LazyFrame) -> dict[tuple[str, str], float]:
+    """(contingency, element) -> vm for two monitored busbar sections that share the bus breaker bus VL_1_0."""
+    voltage_levels = pl.LazyFrame(
+        {"id": ["VL_1"], "nominal_v": [225.0], "high_voltage_limit": [245.0], "low_voltage_limit": [205.0]}
+    )
+    bus_map = pl.LazyFrame({"id": ["BBS_1", "BBS_2", "VL_1_0"], "bus_breaker_bus_id": ["VL_1_0", "VL_1_0", "VL_1_0"]})
+    node_results = get_node_results_polars(
+        bus_results, ["BBS_1", "BBS_2"], bus_map, voltage_levels, failed_outages=[], timestep=0, method="ac"
+    ).collect()
+    return {(row["contingency"], row["element"]): row["vm"] for row in node_results.iter_rows(named=True)}
+
+
+def test_get_node_results_polars_reads_a_contingency_reported_per_bus_breaker_bus() -> None:
+    # with several threads the analysis reports some contingencies per busbar section and others per bus breaker bus
+    bus_results = pl.LazyFrame(
+        {
+            "contingency_id": ["", "", "per_section", "per_section", "per_bus"],
+            "operator_strategy_id": [""] * 5,
+            "voltage_level_id": ["VL_1"] * 5,
+            "bus_id": ["BBS_1", "BBS_2", "BBS_1", "BBS_2", "VL_1_0"],
+            "v_mag": [224.0, 224.0, 223.0, 222.0, 221.0],
+            "v_angle": [0.0] * 5,
+        }
+    )
+
+    vm = _node_results_of_two_busbar_sections(bus_results)
+
+    assert vm[("per_section", "BBS_1")] == 223.0
+    assert vm[("per_section", "BBS_2")] == 222.0
+    assert vm[("per_bus", "BBS_1")] == 221.0
+    assert vm[("per_bus", "BBS_2")] == 221.0
+    assert len(vm) == 6
+
+
+def test_get_node_results_polars_decides_per_voltage_level_how_a_contingency_is_reported() -> None:
+    # a monitored bus breaker bus of another voltage level is reported by its own id in every contingency; that must
+    # not hide that VL_1 came back per bus breaker bus
+    bus_results = pl.LazyFrame(
+        {
+            "contingency_id": ["", "", "", "per_bus", "per_bus"],
+            "operator_strategy_id": [""] * 5,
+            "voltage_level_id": ["VL_1", "VL_1", "VL_2", "VL_1", "VL_2"],
+            "bus_id": ["BBS_1", "BBS_2", "VL_2_0", "VL_1_0", "VL_2_0"],
+            "v_mag": [224.0, 224.0, 110.0, 221.0, 109.0],
+            "v_angle": [0.0] * 5,
+        }
+    )
+    voltage_levels = pl.LazyFrame(
+        {
+            "id": ["VL_1", "VL_2"],
+            "nominal_v": [225.0, 110.0],
+            "high_voltage_limit": [245.0, 123.0],
+            "low_voltage_limit": [205.0, 99.0],
+        }
+    )
+    bus_map = pl.LazyFrame(
+        {"id": ["BBS_1", "BBS_2", "VL_1_0", "VL_2_0"], "bus_breaker_bus_id": ["VL_1_0", "VL_1_0", "VL_1_0", "VL_2_0"]}
+    )
+
+    node_results = get_node_results_polars(
+        bus_results, ["BBS_1", "BBS_2", "VL_2_0"], bus_map, voltage_levels, failed_outages=[], timestep=0, method="ac"
+    ).collect()
+
+    vm = {(row["contingency"], row["element"]): row["vm"] for row in node_results.iter_rows(named=True)}
+    assert vm[("per_bus", "BBS_1")] == 221.0
+    assert vm[("per_bus", "BBS_2")] == 221.0
+    assert vm[("per_bus", "VL_2_0")] == 109.0
+    assert len(vm) == 6
+
+
+def test_get_node_results_polars_leaves_out_a_busbar_section_without_a_result_of_its_own() -> None:
+    # BBS_2 is dead after the contingency: the row of BBS_1, which shared its bus breaker bus, is not its voltage
+    bus_results = pl.LazyFrame(
+        {
+            "contingency_id": ["", "", "contingency_1"],
+            "operator_strategy_id": [""] * 3,
+            "voltage_level_id": ["VL_1"] * 3,
+            "bus_id": ["BBS_1", "BBS_2", "BBS_1"],
+            "v_mag": [224.0, 224.0, 223.0],
+            "v_angle": [0.0] * 3,
+        }
+    )
+
+    vm = _node_results_of_two_busbar_sections(bus_results)
+
+    assert ("contingency_1", "BBS_2") not in vm
+    assert vm[("contingency_1", "BBS_1")] == 223.0
+
+
+def test_get_node_results_polars_reads_a_monitored_bus_breaker_bus_from_its_busbar_section() -> None:
+    # the analysis reports a bus breaker bus by its own id in one contingency and by its busbar section in another
+    bus_results = pl.LazyFrame(
+        {
+            "contingency_id": ["", "own", "own", "section", "nothing"],
+            "operator_strategy_id": [""] * 5,
+            "voltage_level_id": ["VL_1"] * 4 + ["VL_2"],
+            "bus_id": ["VL_1_0", "VL_1_0", "BBS_1", "BBS_1", "VL_2_0"],
+            "v_mag": [224.0, 223.0, 999.0, 222.0, 110.0],
+            "v_angle": [0.0, 1.0, 9.0, 2.0, 0.0],
+        }
+    )
+    voltage_levels = pl.LazyFrame(
+        {
+            "id": ["VL_1", "VL_2"],
+            "nominal_v": [225.0, 110.0],
+            "high_voltage_limit": [245.0, 123.0],
+            "low_voltage_limit": [205.0, 99.0],
+        }
+    )
+    bus_map = pl.LazyFrame({"id": ["BBS_1", "VL_1_0", "VL_2_0"], "bus_breaker_bus_id": ["VL_1_0", "VL_1_0", "VL_2_0"]})
+
+    node_results = get_node_results_polars(
+        bus_results, ["VL_1_0"], bus_map, voltage_levels, failed_outages=[], timestep=0, method="ac"
+    ).collect()
+
+    va = {row["contingency"]: row["va"] for row in node_results.iter_rows(named=True)}
+    # its own row where it has one, the row of its busbar section where it has not, and nothing where neither is
+    assert va == {"": 0.0, "own": 1.0, "section": 2.0}

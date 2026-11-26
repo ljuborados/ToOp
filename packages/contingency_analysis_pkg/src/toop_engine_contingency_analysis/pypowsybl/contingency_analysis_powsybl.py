@@ -7,6 +7,7 @@
 
 """Compute the N-1 AC/DC power flow for the network."""
 
+from collections.abc import Collection, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -16,9 +17,23 @@ import pypowsybl
 from beartype.typing import Literal, Optional, Sequence, Union
 from pypowsybl.network import Network
 from pypowsybl.security import SecurityAnalysisResult
+from toop_engine_contingency_analysis.pypowsybl.outage_loadflows import (
+    RawSecurityResults,
+    SynchronousComponents,
+    basecase_bus_rows,
+    concat_raw_results,
+    conform_raw_results,
+    contingencies_touching_non_main_components,
+    copy_basecase_rows,
+    get_synchronous_components,
+    resolve_slack_buses,
+    run_contingencies_as_loadflows,
+    with_slack_buses,
+)
 from toop_engine_contingency_analysis.pypowsybl.powsybl_helpers import (
     PowsyblNMinus1Definition,
     add_name_column,
+    convert_powsybl_status,
     fingerprint_current_limits_for_powsybl,
     get_convergence_result_df,
     get_current_branch_limits_for_powsybl,
@@ -52,6 +67,7 @@ from toop_engine_interfaces.loadflow_result_filter import LoadflowResultFilter
 from toop_engine_interfaces.loadflow_result_helpers import convert_polars_loadflow_results_to_pandas
 from toop_engine_interfaces.loadflow_result_helpers_polars import concatenate_loadflow_results_polars
 from toop_engine_interfaces.loadflow_results import (
+    ConvergenceStatus,
     LoadflowResults,
 )
 from toop_engine_interfaces.loadflow_results_polars import LoadflowResultsPolars
@@ -134,6 +150,33 @@ def build_branch_limit_cache(
     )
 
 
+def _add_contingency_voltage_levels(
+    analysis: pypowsybl.security.SecurityAnalysis, n_minus_1_definition: PowsyblNMinus1Definition
+) -> None:
+    """Monitor the voltage levels a contingency reports on top of the common ones.
+
+    OpenLoadFlow reports a contingency with monitored elements of its own from those alone, without the ones monitored
+    in every contingency, so each of these lists repeats the common elements. Contingencies with the same voltage
+    levels share a list.
+    """
+    monitored = n_minus_1_definition.monitored_elements
+    common = set(monitored["voltage_levels"])
+    outage_ids = {contingency.id for contingency in n_minus_1_definition.contingencies if contingency.elements}
+    by_voltage_levels: dict[tuple[str, ...], list[str]] = {}
+    for contingency_id, voltage_levels in n_minus_1_definition.contingency_voltage_levels.items():
+        extra = tuple(sorted(set(voltage_levels) - common))
+        if extra and contingency_id in outage_ids:
+            by_voltage_levels.setdefault(extra, []).append(contingency_id)
+    for extra, contingency_ids in by_voltage_levels.items():
+        analysis.add_monitored_elements(
+            contingency_context_type=pypowsybl.security.ContingencyContextType.SPECIFIC,
+            contingency_ids=contingency_ids,
+            branch_ids=monitored["branches"],
+            three_windings_transformer_ids=monitored["trafo3w"],
+            voltage_level_ids=[*monitored["voltage_levels"], *extra],
+        )
+
+
 def run_powsybl_analysis(
     net: Network,
     n_minus_1_definition: PowsyblNMinus1Definition,
@@ -159,6 +202,7 @@ def run_powsybl_analysis(
         The security analysis result from powsybl containing the monitored elements and the results of the contingencies.
     basecase_id : str | None
         The name of the basecase contingency, if it is included in the run. Otherwise None.
+        Contingencies without elements other than the base case are not passed to powsybl; they have no impact.
     """
     # Run the actual loadflow computation
     analysis = pypowsybl.security.create_analysis()
@@ -167,14 +211,16 @@ def run_powsybl_analysis(
         three_windings_transformer_ids=n_minus_1_definition.monitored_elements["trafo3w"],
         voltage_level_ids=n_minus_1_definition.monitored_elements["voltage_levels"],
     )
+    _add_contingency_voltage_levels(analysis, n_minus_1_definition)
     basecase_id = None
     for contingency in n_minus_1_definition.contingencies:
         outages = contingency.elements
         if len(outages) > 1:
             analysis.add_multiple_elements_contingency(outages, contingency_id=contingency.id)
         elif len(outages) == 0:
-            # If there are no outages, we add the basecase contingency
-            basecase_id = contingency.id
+            # Without a declared base case the empty contingency is the base case, as it always was
+            if n_minus_1_definition.basecase_id in (None, contingency.id):
+                basecase_id = contingency.id
         else:
             analysis.add_single_element_contingency(outages[0], contingency_id=contingency.id)
 
@@ -185,51 +231,88 @@ def run_powsybl_analysis(
     return res, basecase_id
 
 
-def _run_contingency_analysis_polars(
+def _outage_ids(pow_n1_definition: PowsyblNMinus1Definition, basecase_id: str | None) -> list[str]:
+    """Every contingency of the definition except the base case."""
+    return [
+        contingency.id
+        for contingency in pow_n1_definition.contingencies
+        if not (contingency.is_basecase() and contingency.id == basecase_id)
+    ]
+
+
+def _security_analysis_raw(
     net: Network,
     pow_n1_definition: PowsyblNMinus1Definition,
-    job_id: str,
     timestep: int,
     security_analysis_params: pypowsybl.security.Parameters,
-    method: Literal["ac", "dc"] = "dc",
-) -> LoadflowResultsPolars:
-    """Compute the N-0 + N-1 power flow for the network.
+    method: Literal["ac", "dc"],
+    components: Optional[SynchronousComponents],
+) -> tuple[RawSecurityResults, pd.DataFrame, list[str], str | None, pl.LazyFrame]:
+    """Run the security analysis and complete its raw results.
 
-    Parameters
-    ----------
-    net : Network
-        The powsybl network to compute the Contingency Analysis for
-    pow_n1_definition : PowsyblNMinus1Definition
-        The N-1 definition to use for the contingency analysis. Contains outages and monitored elements
-    job_id : str
-        The job id of the current job
-    timestep : int
-        The timestep to use for the contingency analysis
-    security_analysis_params : pypowsybl.security.Parameters
-        The security analysis parameters, used as they are, see get_monitored_security_analysis_params. The
-        parallelization is done by OpenLoadFlow via the provider parameter threadCount.
-    method : Literal["ac", "dc"], optional
-        Whether to compute the AC or DC power flow, by default "dc"
-
-    Returns
-    -------
-    LoadflowResultsPolars
-        The results of the loadflow computation. Invalid or otherwise failed results will be set to NaN.
+    Contingencies without elements get the base case rows and status, and with ``fill_no_impact_contingencies`` of the
+    definition so do the contingencies powsybl reports no result for (it leaves out contingencies that do not change
+    the network). With *components*, the converged contingencies
+    also get the base case rows of the synchronous components other than the main one, which OpenLoadFlow does not
+    solve after a contingency. The last value returned is the connectivity result of the analysis.
     """
-    monitored_elements = pow_n1_definition.monitored_elements
     ca_result, basecase_id = run_powsybl_analysis(
         net, pow_n1_definition, security_analysis_params=security_analysis_params, method=method
     )
-    bus_results = get_ca_bus_results(ca_result, lazy=True)
-    branch_results = get_ca_branch_results(ca_result, lazy=True)
-    three_windings_transformer_results = get_ca_three_windings_transformer_results(ca_result, lazy=True)
+    raw = conform_raw_results(
+        RawSecurityResults(
+            get_ca_bus_results(ca_result, lazy=True),
+            get_ca_branch_results(ca_result, lazy=True),
+            get_ca_three_windings_transformer_results(ca_result, lazy=True),
+        )
+    )
     post_contingency_results = ca_result.post_contingency_results
     pre_contingency_result = ca_result.pre_contingency_result
-
-    all_outage_ids = [contingency.id for contingency in pow_n1_definition.contingencies if not contingency.is_basecase()]
+    outage_ids = _outage_ids(pow_n1_definition, basecase_id)
     convergence_df, failed_outages = get_convergence_result_df(
-        post_contingency_results, pre_contingency_result, all_outage_ids, timestep, basecase_id
+        post_contingency_results, pre_contingency_result, outage_ids, timestep, basecase_id
     )
+    # A contingency without elements is not passed to powsybl and cannot change the grid. One with elements that powsybl
+    # leaves out is only filled when asked for.
+    without_elements = {contingency.id for contingency in pow_n1_definition.contingencies if not contingency.elements}
+    no_impact = [
+        outage
+        for outage in outage_ids
+        if outage not in post_contingency_results
+        and (outage in without_elements or pow_n1_definition.fill_no_impact_contingencies)
+    ]
+    if no_impact:
+        basecase_status = convert_powsybl_status(pre_contingency_result.status)
+        convergence_df.loc[[(timestep, outage) for outage in no_impact], "status"] = basecase_status
+        if basecase_status == ConvergenceStatus.CONVERGED.value:
+            failed_outages = [outage for outage in failed_outages if outage not in no_impact]
+            raw = copy_basecase_rows(raw, no_impact)
+    if components is not None:
+        solved = [outage for outage in outage_ids if outage not in failed_outages and outage not in no_impact]
+        raw = copy_basecase_rows(raw, solved, components)
+    connectivity_result = get_connectivity_results(get_post_contingency_results(list(post_contingency_results.values())))
+    return raw, convergence_df, failed_outages, basecase_id, connectivity_result
+
+
+# pylint: disable-next=too-many-positional-arguments
+def _shape_results(
+    raw: RawSecurityResults,
+    convergence_df: pd.DataFrame,
+    failed_outages: list[str],
+    basecase_id: str | None,
+    pow_n1_definition: PowsyblNMinus1Definition,
+    job_id: str,
+    timestep: int,
+    method: Literal["ac", "dc"],
+    connectivity_result: Optional[pl.LazyFrame] = None,
+) -> LoadflowResultsPolars:
+    """Turn raw security analysis frames into the loadflow result tables."""
+    monitored_elements = pow_n1_definition.monitored_elements
+    bus_results = raw.bus_results
+    branch_results = raw.branch_results
+    three_windings_transformer_results = raw.three_windings_transformer_results
+    all_outage_ids = _outage_ids(pow_n1_definition, basecase_id)
+
     add_name_column(convergence_df, pow_n1_definition.contingency_name_mapping, index_level="contingency")
     convergence_df = pl.from_pandas(convergence_df, include_index=True, nan_to_null=False).lazy()
 
@@ -253,7 +336,6 @@ def _run_contingency_analysis_polars(
         timestep,
         method,
     )
-    connectivity_result = get_connectivity_results(get_post_contingency_results(list(post_contingency_results.values())))
     regulating_elements_df = get_regulating_element_results(
         monitored_elements["buses"], timestep=timestep, basecase_name=basecase_id
     )
@@ -264,6 +346,7 @@ def _run_contingency_analysis_polars(
         va_diff_with_buses=pl.from_pandas(pow_n1_definition.blank_va_diff, include_index=True, nan_to_null=False).lazy(),
         bus_map=pl.from_pandas(pow_n1_definition.bus_map, include_index=True, nan_to_null=False).lazy(),
         timestep=timestep,
+        bus_components=raw.bus_components,
     )
     branch_results_df = update_basename_polars(branch_results_df, basecase_id)
     branch_results_df = add_name_column_polars(
@@ -297,7 +380,7 @@ def _run_contingency_analysis_polars(
         va_diff_results_df, pow_n1_definition.contingency_name_mapping, index_level="contingency"
     )
 
-    lf_results = LoadflowResultsPolars(
+    return LoadflowResultsPolars(
         job_id=job_id,
         branch_results=branch_results_df,
         branch_limits=branch_limits_df,
@@ -309,9 +392,93 @@ def _run_contingency_analysis_polars(
         warnings=[],
         lazy=True,
     )
-    return lf_results
 
 
+def _run_contingency_analysis_polars(
+    net: Network,
+    pow_n1_definition: PowsyblNMinus1Definition,
+    job_id: str,
+    timestep: int,
+    security_analysis_params: pypowsybl.security.Parameters,
+    method: Literal["ac", "dc"] = "dc",
+    components: Optional[SynchronousComponents] = None,
+) -> LoadflowResultsPolars:
+    """Compute the N-0 + N-1 power flow for the network.
+
+    Parameters
+    ----------
+    net : Network
+        The powsybl network to compute the Contingency Analysis for
+    pow_n1_definition : PowsyblNMinus1Definition
+        The N-1 definition to use for the contingency analysis. Contains outages and monitored elements
+    job_id : str
+        The job id of the current job
+    timestep : int
+        The timestep to use for the contingency analysis
+    security_analysis_params : pypowsybl.security.Parameters
+        The security analysis parameters, used as they are, see get_monitored_security_analysis_params. The
+        parallelization is done by OpenLoadFlow via the provider parameter threadCount.
+    method : Literal["ac", "dc"], optional
+        Whether to compute the AC or DC power flow, by default "dc"
+    components : Optional[SynchronousComponents], optional
+        If given, contingencies get the base case values of the synchronous components other than the main one.
+
+    Returns
+    -------
+    LoadflowResultsPolars
+        The results of the loadflow computation. Invalid or otherwise failed results will be set to NaN.
+    """
+    raw, convergence_df, failed_outages, basecase_id, connectivity_result = _security_analysis_raw(
+        net, pow_n1_definition, timestep, security_analysis_params, method, components
+    )
+    return _shape_results(
+        raw, convergence_df, failed_outages, basecase_id, pow_n1_definition, job_id, timestep, method, connectivity_result
+    )
+
+
+def _run_loadflow_contingencies_polars(
+    net: Network,
+    pow_n1_definition: PowsyblNMinus1Definition,
+    job_id: str,
+    timestep: int,
+    lf_params: pypowsybl.loadflow.Parameters,
+    slack_overrides: Mapping[str, Sequence[str]],
+) -> LoadflowResultsPolars:
+    """Solve the (non-basecase) contingencies of the definition one by one, every island included."""
+    monitored = pow_n1_definition.monitored_elements
+    contingencies = {contingency.id: contingency.elements for contingency in pow_n1_definition.contingencies}
+    raw, statuses = run_contingencies_as_loadflows(
+        net,
+        contingencies,
+        lf_params,
+        monitored_branches=monitored["branches"],
+        monitored_trafo3w=monitored["trafo3w"],
+        monitored_voltage_levels=monitored["voltage_levels"],
+        slack_bus_overrides=slack_overrides,
+        contingency_voltage_levels=pow_n1_definition.contingency_voltage_levels,
+    )
+    # A security analysis brings its pre-contingency rows along; here they are added, for the base case voltages
+    extra_voltage_levels = {
+        voltage_level
+        for contingency_id in contingencies
+        for voltage_level in pow_n1_definition.contingency_voltage_levels.get(contingency_id, ())
+    }
+    raw = concat_raw_results([basecase_bus_rows(net, lf_params, {*monitored["voltage_levels"], *extra_voltage_levels}), raw])
+    outage_ids = list(contingencies)
+    convergence_df = pd.DataFrame(
+        {
+            "status": [convert_powsybl_status(statuses[outage]) for outage in outage_ids],
+            "iteration_count": float("nan"),
+            "warnings": "",
+            "contingency_name": "",
+        },
+        index=pd.MultiIndex.from_product([[timestep], outage_ids], names=["timestep", "contingency"]),
+    )
+    failed_outages = [outage for outage in outage_ids if statuses[outage] != pypowsybl.loadflow.ComponentStatus.CONVERGED]
+    return _shape_results(raw, convergence_df, failed_outages, None, pow_n1_definition, job_id, timestep, "ac")
+
+
+# pylint: disable-next=too-many-positional-arguments
 def run_contingency_analysis_polars(
     net: Network,
     pow_n1_definition: PowsyblNMinus1Definition,
@@ -321,6 +488,7 @@ def run_contingency_analysis_polars(
     method: Literal["ac", "dc"] = "dc",
     result_filter: Optional[LoadflowResultFilter] = None,
     batch_size: Optional[int] = None,
+    components: Optional[SynchronousComponents] = None,
 ) -> LoadflowResultsPolars:
     """Compute N-0 + N-1 power flows, optionally processing outages in sequential batches.
 
@@ -343,6 +511,8 @@ def run_contingency_analysis_polars(
     batch_size : int, optional
         Maximum number of outage contingencies per sequential Powsybl analysis. The N-0 basecase, if present, is run
         with the first batch and does not count towards this limit. If None, all contingencies are processed together.
+    components : Optional[SynchronousComponents], optional
+        If given, contingencies get the base case values of the synchronous components other than the main one.
 
     Returns
     -------
@@ -354,14 +524,19 @@ def run_contingency_analysis_polars(
     ValueError
         If batch_size is not positive.
     """
-    basecase_contingencies = [contingency for contingency in pow_n1_definition.contingencies if contingency.is_basecase()]
+    basecase_contingencies = [
+        contingency
+        for contingency in pow_n1_definition.contingencies
+        if contingency.is_basecase() and pow_n1_definition.basecase_id in (None, contingency.id)
+    ]
+    basecase_ids = {contingency.id for contingency in basecase_contingencies}
     if batch_size is None:
         contingency_batches = [pow_n1_definition.contingencies]
     else:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         outage_contingencies = [
-            contingency for contingency in pow_n1_definition.contingencies if not contingency.is_basecase()
+            contingency for contingency in pow_n1_definition.contingencies if contingency.id not in basecase_ids
         ]
         outage_batches = [
             outage_contingencies[start : start + batch_size] for start in range(0, len(outage_contingencies), batch_size)
@@ -379,6 +554,7 @@ def run_contingency_analysis_polars(
             timestep,
             security_analysis_params,
             method,
+            components,
         )
         for contingencies in contingency_batches
     ]
@@ -414,7 +590,83 @@ def get_monitored_security_analysis_params(
     return security_analysis_params
 
 
-def run_contingency_analysis_powsybl(
+def _split_contingencies(
+    pow_n1_definition: PowsyblNMinus1Definition,
+    loadflow_ids: set[str],
+    slack_overrides: Mapping[str, Sequence[str]],
+) -> tuple[PowsyblNMinus1Definition, dict[tuple[str, ...], PowsyblNMinus1Definition], PowsyblNMinus1Definition]:
+    """Split a definition into the main security analysis, one per distinct slack override, and the load flow ones."""
+    main, by_slack, loadflow = [], {}, []
+    for contingency in pow_n1_definition.contingencies:
+        if contingency.id in loadflow_ids and not contingency.is_basecase():
+            loadflow.append(contingency)
+        elif contingency.id in slack_overrides and not contingency.is_basecase():
+            by_slack.setdefault(tuple(slack_overrides[contingency.id]), []).append(contingency)
+        else:
+            main.append(contingency)
+
+    def subset(contingencies: list) -> PowsyblNMinus1Definition:
+        return pow_n1_definition.model_copy(update={"contingencies": contingencies})
+
+    return subset(main), {key: subset(value) for key, value in by_slack.items()}, subset(loadflow)
+
+
+# pylint: disable-next=too-many-positional-arguments
+def _run_with_overrides(
+    net: Network,
+    pow_n1_definition: PowsyblNMinus1Definition,
+    job_id: str,
+    timestep: int,
+    method: Literal["ac", "dc"],
+    security_analysis_params: pypowsybl.security.Parameters,
+    batch_size: Optional[int],
+    components: Optional[SynchronousComponents],
+    loadflow_ids: set[str],
+    slack_overrides: Mapping[str, Sequence[str]],
+) -> LoadflowResultsPolars:
+    """Run the main security analysis, one per slack override, and the per-contingency load flows; concatenate."""
+    if method != "ac":
+        raise ValueError("Slack overrides and per-contingency load flows need method='ac'")
+    main, by_slack, loadflow = _split_contingencies(pow_n1_definition, loadflow_ids, slack_overrides)
+    common = {
+        "net": net,
+        "job_id": job_id,
+        "timestep": timestep,
+        "method": method,
+        "batch_size": batch_size,
+        "components": components,
+    }
+    lf_params = security_analysis_params.load_flow_parameters
+    parts = [
+        run_contingency_analysis_polars(pow_n1_definition=main, security_analysis_params=security_analysis_params, **common)
+    ]
+    for slack_ids, definition in by_slack.items():
+        slack_params = deepcopy(security_analysis_params)
+        slack_params.load_flow_parameters = with_slack_buses(lf_params, resolve_slack_buses(net, slack_ids))
+        parts.append(
+            run_contingency_analysis_polars(pow_n1_definition=definition, security_analysis_params=slack_params, **common)
+        )
+    if loadflow.contingencies:
+        parts.append(_run_loadflow_contingencies_polars(net, loadflow, job_id, timestep, lf_params, slack_overrides))
+    return concatenate_loadflow_results_polars(parts)
+
+
+def _non_main_components(
+    net: Network,
+    pow_n1_definition: PowsyblNMinus1Definition,
+    lf_params: pypowsybl.loadflow.Parameters,
+    method: Literal["ac", "dc"],
+) -> tuple[SynchronousComponents, set[str]]:
+    """Return the synchronous components of the network and the contingencies with an element outside the main one."""
+    if method != "ac":
+        raise ValueError("fill_non_main_components needs method='ac'")
+    components = get_synchronous_components(net, lf_params)
+    contingencies = {contingency.id: contingency.elements for contingency in pow_n1_definition.contingencies}
+    return components, contingencies_touching_non_main_components(net, contingencies, components)
+
+
+# pylint: disable-next=too-many-positional-arguments,too-many-locals
+def run_contingency_analysis_powsybl(  # noqa: PLR0913
     net: Network,
     n_minus_1_definition: Nminus1Definition,
     job_id: str,
@@ -426,6 +678,12 @@ def run_contingency_analysis_powsybl(
     result_filter: Optional[LoadflowResultFilter] = None,
     batch_size: Optional[int] = None,
     security_analysis_params: Optional[pypowsybl.security.Parameters] = None,
+    slack_overrides: Optional[Mapping[str, Sequence[str]]] = None,
+    loadflow_contingency_ids: Optional[Collection[str]] = None,
+    fill_non_main_components: bool = False,
+    fill_no_impact_contingencies: bool = False,
+    monitored_voltage_levels: Optional[Collection[str]] = None,
+    contingency_voltage_levels: Optional[Mapping[str, Collection[str]]] = None,
 ) -> Union[LoadflowResults, LoadflowResultsPolars]:
     """Compute the Contingency Analysis for the network.
 
@@ -461,6 +719,27 @@ def run_contingency_analysis_powsybl(
         are defined: with contingencyPropagation "false", they have to be propagated already, see
         propagate_busbar_contingencies. If None, get_cgmes_distributed_slack_parameters (AC) or
         get_single_slack_parameters (DC) is used with a single thread and the contingency propagation of powsybl.
+    slack_overrides : Optional[Mapping[str, Sequence[str]]]
+        Contingency id to the slack to use instead of the one of the load flow parameters, as injection ids (their
+        bus) or bus ids. AC only. Contingencies with the same override share a security analysis.
+    loadflow_contingency_ids : Optional[Collection[str]]
+        Contingencies to solve with their own AC load flow over every island instead of in the security analysis
+        (which solves only the main synchronous component). With a slack override, only the islands holding one of the
+        given slacks are solved.
+    fill_non_main_components : bool
+        Report the synchronous components other than the main one too: contingencies outside them get their base case
+        values, contingencies inside them are solved with their own load flow. AC only.
+    fill_no_impact_contingencies : bool
+        Give contingencies powsybl reports no result for the base case values and status. Powsybl leaves out
+        contingencies that do not change the network, e.g. the outage of an element that is already disconnected. By
+        default they have no result rows and the status NO_CALCULATION. A contingency without elements always gets
+        the base case values.
+    monitored_voltage_levels : Optional[Collection[str]]
+        The voltage levels whose buses are reported in every contingency. If None, they are those of the monitored
+        buses and switches and of both ends of the monitored and outaged branches. A monitored bus outside them has
+        no result. Bus results are the largest part of the result, so give them when fewer are needed.
+    contingency_voltage_levels : Optional[Mapping[str, Collection[str]]]
+        Contingency id to voltage levels reported in that contingency only, on top of the ones above.
 
     Returns
     -------
@@ -480,17 +759,52 @@ def run_contingency_analysis_powsybl(
         net,
         branch_limit_cache=branch_limit_cache,
     )
+    pow_n1_definition.fill_no_impact_contingencies = fill_no_impact_contingencies
+    if monitored_voltage_levels is not None:
+        pow_n1_definition.monitored_elements["voltage_levels"] = sorted(set(monitored_voltage_levels))
+    if contingency_voltage_levels:
+        pow_n1_definition.contingency_voltage_levels = {
+            contingency_id: sorted(set(voltage_levels))
+            for contingency_id, voltage_levels in contingency_voltage_levels.items()
+        }
 
-    lf_result = run_contingency_analysis_polars(
-        net=net,
-        pow_n1_definition=pow_n1_definition,
-        job_id=job_id,
-        timestep=timestep,
-        method=method,
-        security_analysis_params=security_analysis_params,
-        result_filter=result_filter,
-        batch_size=batch_size,
-    )
+    slack_overrides = dict(slack_overrides or {})
+    loadflow_ids = set(loadflow_contingency_ids or ())
+    components = None
+    if fill_non_main_components:
+        components, touching = _non_main_components(
+            net, pow_n1_definition, security_analysis_params.load_flow_parameters, method
+        )
+        loadflow_ids |= touching
+
+    if not slack_overrides and not loadflow_ids:
+        lf_result = run_contingency_analysis_polars(
+            net=net,
+            pow_n1_definition=pow_n1_definition,
+            job_id=job_id,
+            timestep=timestep,
+            method=method,
+            security_analysis_params=security_analysis_params,
+            result_filter=result_filter,
+            batch_size=batch_size,
+            components=components,
+        )
+    else:
+        lf_result = _run_with_overrides(
+            net,
+            pow_n1_definition,
+            job_id,
+            timestep,
+            method,
+            security_analysis_params,
+            batch_size,
+            components,
+            loadflow_ids,
+            slack_overrides,
+        )
+        basecase = n_minus_1_definition.base_case
+        if result_filter is not None:
+            lf_result = apply_result_filter(lf_result, result_filter, basecase.id if basecase is not None else None)
     if not polars:
         lf_result = convert_polars_loadflow_results_to_pandas(lf_result)
     missing_element_warnings = [

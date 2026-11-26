@@ -7,6 +7,7 @@
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import pypowsybl
 import pytest
 import structlog
@@ -27,6 +28,7 @@ from toop_engine_contingency_analysis.pypowsybl import (
     get_node_results,
     get_regulating_element_results,
     get_va_diff_results,
+    powsybl_helpers,
     prepare_branch_limits,
     propagate_busbar_contingencies,
     translate_contingency_to_powsybl,
@@ -40,6 +42,7 @@ from toop_engine_contingency_analysis.pypowsybl.powsybl_helpers import (
     BRANCH_LIMIT_NAMES,
     _get_bus_contingency_expansions,
 )
+from toop_engine_contingency_analysis.pypowsybl.powsybl_helpers_polars import get_monitored_branch_limits_polars
 from toop_engine_grid_helpers.powsybl.example_grids import (
     basic_node_breaker_network_powsybl,
     create_complex_grid_battery_hvdc_svc_3w_trafo,
@@ -904,6 +907,56 @@ def test_translate_nminus1_for_powsybl_with_branch_limit_cache(
     assert cached_translation.monitored_elements == uncached_translation.monitored_elements
     assert cached_translation.branch_limits.equals(uncached_translation.branch_limits)
     assert cached_translation.blank_va_diff.equals(uncached_translation.blank_va_diff)
+
+
+def test_translate_nminus1_components_skips_busbar_propagation_without_bus_outages(
+    powsybl_node_breaker_net: pypowsybl.network.Network, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    line_id = powsybl_node_breaker_net.get_lines().index[0]
+    nminus1_def = Nminus1Definition(
+        monitored_elements=[],
+        contingencies=[Contingency(id="line", elements=[GridElement(id=line_id, type="LINE", kind="branch")])],
+        id_type="powsybl",
+    )
+
+    def fail(_net: pypowsybl.network.Network) -> None:
+        raise AssertionError("busbar propagation is not needed")
+
+    monkeypatch.setattr(powsybl_helpers, "_get_bus_contingency_expansions", fail)
+    translated = translate_nminus1_components_for_powsybl(nminus1_def, powsybl_node_breaker_net)
+
+    assert translated.contingencies[0].elements == [line_id]
+
+
+def test_translate_nminus1_for_powsybl_has_three_winding_transformer_limits() -> None:
+    net = create_complex_grid_battery_hvdc_svc_3w_trafo()
+    trafo3w_id = net.get_3_windings_transformers().index[0]
+    limits = pd.DataFrame(
+        {
+            "element_id": trafo3w_id,
+            "element_type": "THREE_WINDINGS_TRANSFORMER",
+            "side": ["ONE", "TWO", "THREE"],
+            "name": "permanent_limit",
+            "type": "CURRENT",
+            "value": [100.0, 200.0, 300.0],
+            "acceptable_duration": -1,
+        }
+    ).set_index("element_id")
+    net.create_operational_limits(limits)
+    nminus1_def = Nminus1Definition(
+        monitored_elements=[MonitoredElement(id=trafo3w_id, name="", kind="branch", type="THREE_WINDINGS_TRANSFORMER")],
+        contingencies=[Contingency(id="BASECASE", elements=[])],
+        id_type="powsybl",
+    )
+
+    translated = translate_nminus1_for_powsybl(nminus1_def, net)
+
+    assert translated.monitored_elements["trafo3w"] == [trafo3w_id]
+    assert translated.branch_limits.loc[trafo3w_id, "value"].tolist() == [100.0, 200.0, 300.0]
+
+    # Limits read again for existing results are those of the analysis
+    refreshed = get_monitored_branch_limits_polars(net, nminus1_def, timestep=0).collect()
+    assert sorted(refreshed.filter(pl.col("element") == trafo3w_id)["limit"].to_list()) == [100.0, 200.0, 300.0]
 
 
 def test_get_branch_results():

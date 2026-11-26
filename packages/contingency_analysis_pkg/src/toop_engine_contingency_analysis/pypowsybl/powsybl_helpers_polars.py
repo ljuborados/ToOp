@@ -20,6 +20,7 @@ from pypowsybl.network import Network
 from toop_engine_contingency_analysis.pypowsybl.powsybl_helpers import (
     BRANCH_LIMIT_NAMES,
     get_monitored_branch_ids_for_powsybl,
+    get_monitored_trafo3w_ids_for_powsybl,
     resolve_branch_limits_for_powsybl,
 )
 from toop_engine_interfaces.loadflow_result_helpers import get_failed_branch_results, get_failed_node_results
@@ -87,12 +88,43 @@ def get_node_results_polars(
     )  # m:1 join
     node_results = node_results.drop_nulls("bus_breaker_bus_id")
 
-    monitored_bus_map = bus_map.filter(pl.col("id").is_in(monitored_buses))
-    bus_to_element_map = monitored_bus_map.select(
+    # A monitored bus the analysis reports by its own id takes exactly that row: a contingency can open a switch inside
+    # its bus breaker bus, and then another busbar section of that bus breaker bus is no longer the same electrical bus.
+    own_rows = node_results.filter(pl.col("bus_id").is_in(monitored_buses)).with_columns(pl.col("bus_id").alias("element"))
+    reported_ids = own_rows.select("bus_id").unique().collect().get_column("bus_id")
+    own_ids = set(reported_ids.to_list())
+
+    # The others are reported per bus breaker bus (or by other busbar sections of it). Several busbar sections can
+    # share a bus breaker bus; they are one electrical bus, so one row per bus breaker bus is enough.
+    # The analysis does not report every contingency the same way: with several threads a voltage level can come back
+    # per bus breaker bus in one contingency and per busbar section in the others. A bus reported by its own id
+    # elsewhere is therefore read from its bus breaker bus where its voltage level reports no busbar section at all.
+    # Where the voltage level does report busbar sections and this one is not among them, it has no result.
+    shared_rows = node_results.filter(pl.struct("contingency", "bus_breaker_bus_id").is_first_distinct())
+    bus_to_element_map = bus_map.filter(pl.col("id").is_in(monitored_buses)).select(
         pl.col("bus_breaker_bus_id"),
         pl.col("id").alias("element"),
     )
-    node_results = node_results.join(bus_to_element_map, on=["bus_breaker_bus_id"], how="left")
+    shared_rows = shared_rows.join(bus_to_element_map, on=["bus_breaker_bus_id"], how="left")
+    busbar_sections = bus_map.filter(pl.col("id") != pl.col("bus_breaker_bus_id")).select(pl.col("id").alias("bus_id"))
+    reported_per_section = (
+        node_results.join(busbar_sections, on="bus_id", how="semi").select("contingency", "voltage_level_id").unique()
+    )
+    shared_rows = pl.concat(
+        [
+            shared_rows.filter(~pl.col("element").is_in(own_ids)),
+            shared_rows.filter(pl.col("element").is_in(own_ids) & (pl.col("element") != pl.col("bus_breaker_bus_id"))).join(
+                reported_per_section, on=["contingency", "voltage_level_id"], how="anti"
+            ),
+            # A monitored bus breaker bus is reported by its own id in one contingency and by a busbar section of it
+            # in another. Everything in it is one electrical bus, so where its own row is missing that row is its.
+            shared_rows.filter(pl.col("element").is_in(own_ids) & (pl.col("element") == pl.col("bus_breaker_bus_id"))).join(
+                own_rows.select("contingency", "element"), on=["contingency", "element"], how="anti"
+            ),
+        ],
+        how="vertical_relaxed",
+    )
+    node_results = pl.concat([own_rows, shared_rows], how="diagonal_relaxed")
     # remove not monitored buses
     node_results = node_results.drop_nulls("element")
 
@@ -239,7 +271,12 @@ def get_monitored_branch_limits_polars(
         The limits of the monitored branch sides, one row per branch side and limit name.
     """
     monitored_branch_ids = get_monitored_branch_ids_for_powsybl(nminus1_definition, net.get_branches(attributes=["type"]))
-    prepared_limits = resolve_branch_limits_for_powsybl(net, monitored_branches=monitored_branch_ids)
+    monitored_trafo3w_ids = get_monitored_trafo3w_ids_for_powsybl(
+        nminus1_definition, net.get_3_windings_transformers(attributes=[]).index
+    )
+    prepared_limits = resolve_branch_limits_for_powsybl(
+        net, monitored_branches=[*monitored_branch_ids, *monitored_trafo3w_ids]
+    )
     return get_branch_limits_polars(pl.from_pandas(prepared_limits, include_index=True, nan_to_null=False).lazy(), timestep)
 
 
@@ -361,7 +398,12 @@ def get_branch_results_polars(
 
 @pa.check_types
 def get_va_diff_results_polars(
-    bus_results: pl.LazyFrame, outages: list[str], va_diff_with_buses: pl.LazyFrame, bus_map: pl.LazyFrame, timestep: int
+    bus_results: pl.LazyFrame,
+    outages: list[str],
+    va_diff_with_buses: pl.LazyFrame,
+    bus_map: pl.LazyFrame,
+    timestep: int,
+    bus_components: Optional[pl.LazyFrame] = None,
 ) -> patpl.LazyFrame[VADiffResultSchemaPolars]:
     """Get the voltage angle difference results for the given outages and bus results.
 
@@ -378,6 +420,10 @@ def get_va_diff_results_polars(
         in the Node Breaker model.
     timestep : int
         The timestep of the results.
+    bus_components : Optional[pl.LazyFrame]
+        The synchronous component of bus result rows (``contingency_id``, ``bus_id``, ``synchronous_component``), for
+        results that span several islands. Two buses in different islands have no angle difference: each island has
+        its own angle reference.
 
     Returns
     -------
@@ -385,7 +431,10 @@ def get_va_diff_results_polars(
         The dataframe containing the voltage angle difference results for the given outages.
     """
     basecase_in_result = ""
-    iteration_va_diff = va_diff_with_buses.filter(pl.col("contingency").is_in([basecase_in_result, *outages]))
+    # A switch without bus breaker buses of its own (not retained) comes without bus ids: keep the keys strings
+    iteration_va_diff = va_diff_with_buses.filter(pl.col("contingency").is_in([basecase_in_result, *outages])).with_columns(
+        pl.col("bus_breaker_bus1_id").cast(pl.String), pl.col("bus_breaker_bus2_id").cast(pl.String)
+    )
 
     iteration_va_diff = iteration_va_diff.with_columns(timestep=pl.lit(timestep).cast(pl.Int64))
     # Map busbar sections where there are any. For the rest use the bus_breaker_bus_id from the results (here the bus id)
@@ -397,29 +446,40 @@ def get_va_diff_results_polars(
         pl.col("contingency_id").cast(pl.String),
         pl.col("bus_id").cast(pl.String),
     )
+    if bus_components is None:
+        bus_results = bus_results.with_columns(pl.lit(None, dtype=pl.Int64).alias("synchronous_component"))
+    else:
+        bus_results = bus_results.join(
+            bus_components.select(
+                pl.col("contingency_id").cast(pl.String), pl.col("bus_id").cast(pl.String), "synchronous_component"
+            ).unique(subset=["contingency_id", "bus_id"]),
+            on=["contingency_id", "bus_id"],
+            how="left",
+        )
     bus_results = bus_results.join(bus_map_for_join, left_on=["bus_id"], right_on=["id"], how="left")  # m:1 join
     bus_results = bus_results.with_columns(pl.coalesce("bus_breaker_bus_id", "bus_id").alias("bus_breaker_bus_id"))
 
     # get the voltage angles for both buses in the va_diff definition
-    iteration_va_diff = iteration_va_diff.join(
-        bus_results.select("contingency_id", "bus_breaker_bus_id", "v_angle"),
-        left_on=["contingency", "bus_breaker_bus1_id"],
-        right_on=["contingency_id", "bus_breaker_bus_id"],
-        how="left",
-    )  # m:1 join
-    iteration_va_diff = iteration_va_diff.rename({"v_angle": "v_angle_1"})
-    iteration_va_diff = iteration_va_diff.join(
-        bus_results.select("contingency_id", "bus_breaker_bus_id", "v_angle"),
-        left_on=["contingency", "bus_breaker_bus2_id"],
-        right_on=["contingency_id", "bus_breaker_bus_id"],
-        how="left",
-    )  # m:1 join
-    iteration_va_diff = iteration_va_diff.rename({"v_angle": "v_angle_2"})
+    bus_angles = bus_results.select("contingency_id", "bus_breaker_bus_id", "v_angle", "synchronous_component")
+    for side in ("1", "2"):
+        iteration_va_diff = iteration_va_diff.join(
+            bus_angles.rename({"v_angle": f"v_angle_{side}", "synchronous_component": f"component_{side}"}),
+            left_on=["contingency", f"bus_breaker_bus{side}_id"],
+            right_on=["contingency_id", "bus_breaker_bus_id"],
+            how="left",
+        )  # m:1 join
 
-    # Calculate the voltage angle difference
-    iteration_va_diff = iteration_va_diff.with_columns(
-        (pl.col("v_angle_1") - pl.col("v_angle_2")).cast(pl.Float64).alias("va_diff")
+    # Calculate the voltage angle difference; there is none between two islands
+    same_island = (
+        pl.col("component_1").is_null() | pl.col("component_2").is_null() | (pl.col("component_1") == pl.col("component_2"))
     )
+    iteration_va_diff = iteration_va_diff.with_columns(
+        pl.when(same_island)
+        .then(pl.col("v_angle_1") - pl.col("v_angle_2"))
+        .otherwise(None)
+        .cast(pl.Float64)
+        .alias("va_diff")
+    ).drop("component_1", "component_2")
 
     # drop duplicates
     iteration_va_diff = iteration_va_diff.unique()

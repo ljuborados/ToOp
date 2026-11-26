@@ -21,7 +21,7 @@ import pandera.pandas as pa
 import pandera.typing as pat
 import pypowsybl
 import structlog
-from beartype.typing import Literal, Optional, Protocol, Sequence, Union, get_args, runtime_checkable
+from beartype.typing import Collection, Literal, Optional, Protocol, Sequence, Union, get_args, runtime_checkable
 from pydantic import BaseModel
 from pypowsybl._pypowsybl import PostContingencyResult, PreContingencyResult
 from pypowsybl.network import Network
@@ -201,6 +201,23 @@ class PowsyblNMinus1Definition(BaseModel):
 
     distributed_slack: bool = True
     """Whether to distribute the slack across the generators in the grid. Only relevant for powsybl grids."""
+
+    basecase_id: Optional[str] = None
+    """The id of the base case contingency of the original N-1 definition, if it has one.
+
+    Only this contingency is run as the base case. Any other contingency without elements cannot change the grid and
+    is reported with the base case values."""
+
+    contingency_voltage_levels: dict[str, list[str]] = {}
+    """Contingency id to voltage levels whose buses are reported in that contingency only, on top of the monitored
+    ones. Bus results are the largest part of a security analysis result, so a voltage level that matters in a few
+    contingencies is cheaper here than among the monitored voltage levels."""
+
+    fill_no_impact_contingencies: bool = False
+    """Whether a contingency powsybl reports no result for gets the base case values and status.
+
+    Powsybl leaves out contingencies that do not change the network, e.g. the outage of an element that is already
+    disconnected. By default they have no result rows and the status NO_CALCULATION."""
 
     contingency_propagation: bool = False
     """Whether to enable powsybl's contingency propagation in the N-1 analysis.
@@ -385,6 +402,27 @@ def get_monitored_branch_ids_for_powsybl(nminus1_definition: Nminus1Definition, 
     ]
 
 
+def get_monitored_trafo3w_ids_for_powsybl(nminus1_definition: Nminus1Definition, trafo3w_ids: Collection[str]) -> list[str]:
+    """Get the monitored three winding transformers of the N-1 definition that exist in the network.
+
+    Parameters
+    ----------
+    nminus1_definition : Nminus1Definition
+        The N-1 definition holding the monitored elements.
+    trafo3w_ids : Collection[str]
+        The ids of the three winding transformers of the network.
+
+    Returns
+    -------
+    list[str]
+        The ids of the monitored three winding transformers, in N-1 definition order.
+    """
+    known = set(trafo3w_ids)
+    return [
+        element.id for element in nminus1_definition.monitored_elements if element.kind == "branch" and element.id in known
+    ]
+
+
 def translate_monitored_elements_to_powsybl(
     nminus1_definition: Nminus1Definition, branches: pd.DataFrame, buses: pd.DataFrame, switches: pd.DataFrame
 ) -> tuple[PowsyblMonitoredElements, dict[str, str], list[GridElement]]:
@@ -417,12 +455,11 @@ def translate_monitored_elements_to_powsybl(
     monitored_elements = nminus1_definition.monitored_elements
     all_monitored_branches = [element.id for element in monitored_elements if element.kind == "branch"]
     missing_branches = set(all_monitored_branches) - set(branches.index)
-    monitored_branch_df = branches.loc[
-        [branch_id for branch_id in all_monitored_branches if branch_id not in missing_branches]
-    ]
     monitored_branches = get_monitored_branch_ids_for_powsybl(nminus1_definition, branches)
 
-    monitored_trafo3w = monitored_branch_df.loc[monitored_branch_df.type == "THREE_WINDINGS_TRANSFORMER"].index.tolist()
+    monitored_trafo3w = get_monitored_trafo3w_ids_for_powsybl(
+        nminus1_definition, branches.index[branches["type"] == "THREE_WINDINGS_TRANSFORMER"]
+    )
 
     all_monitored_buses = [element.id for element in monitored_elements if element.kind == "bus"]
     missing_buses = set(all_monitored_buses) - set(buses.index)
@@ -595,8 +632,10 @@ def get_blank_va_diff_with_buses(
         if contingency.elements[0] in branch_indizes
     }
     branches = branches.loc[single_branch_outages.values()][["bus_breaker_bus1_id", "bus_breaker_bus2_id"]]
-    switches = switches.loc[monitored_switches]
-    switches = switches[switches.open & switches.retained][["bus_breaker_bus1_id", "bus_breaker_bus2_id"]]
+    all_monitored_switches = switches.loc[monitored_switches]
+    switches = all_monitored_switches[all_monitored_switches.open & all_monitored_switches.retained][
+        ["bus_breaker_bus1_id", "bus_breaker_bus2_id"]
+    ]
     element_df = pd.concat([branches, switches], axis=0)
     all_outage_ids = [contingency.id for contingency in pow_contingencies if len(contingency.elements) > 0]
     blank_va_diff = get_blank_va_diff(all_outage_ids, single_branch_outages, switches.index.tolist())
@@ -604,6 +643,26 @@ def get_blank_va_diff_with_buses(
     va_diff_with_buses = blank_va_diff.merge(
         element_df, left_on=blank_va_diff.index.get_level_values("element"), right_index=True, how="left"
     ).drop(columns="key_0")
+
+    # A monitored switch that a contingency opens has an angle across it only in that contingency. Its two sides are
+    # separate bus breaker buses only if the switch is retained, otherwise the angles stay unknown (NaN).
+    opened_rows = [
+        (contingency.id, element)
+        for contingency in pow_contingencies
+        for element in contingency.elements
+        if element in all_monitored_switches.index and element not in switches.index
+    ]
+    if opened_rows:
+        opened = pd.DataFrame(opened_rows, columns=["contingency", "element"]).drop_duplicates()
+        opened = opened.join(all_monitored_switches[["bus_breaker_bus1_id", "bus_breaker_bus2_id"]], on="element").set_index(
+            ["contingency", "element"]
+        )
+        va_diff_with_buses = pd.concat([va_diff_with_buses, opened], axis=0)
+    # A switch that is not retained has no bus breaker buses of its own. The columns stay strings with None for a
+    # missing bus: a float NaN among the ids would give them a mixed type that cannot be joined on.
+    bus_columns = ["bus_breaker_bus1_id", "bus_breaker_bus2_id"]
+    bus_ids = va_diff_with_buses[bus_columns].astype(object)
+    va_diff_with_buses[bus_columns] = bus_ids.where(bus_ids.notna() & (bus_ids != ""), None)
     return va_diff_with_buses
 
 
@@ -926,7 +985,9 @@ def translate_nminus1_components_for_powsybl(
     bus_columns = ["bus_breaker_bus1_id", "bus_breaker_bus2_id"]
     busbar_buses = get_busbar_bus_breaker_buses(net, va_diff_with_buses[bus_columns].stack().astype(str).tolist())
     va_diff_with_buses[bus_columns] = va_diff_with_buses[bus_columns].apply(lambda column: column.replace(busbar_buses))
+    base_case = nminus1_definition.base_case
     return PowsyblNMinus1Definition(
+        basecase_id=base_case.id if base_case is not None else None,
         contingencies=pow_contingencies,
         blank_va_diff=va_diff_with_buses,
         monitored_elements=monitored_elements,
@@ -965,9 +1026,10 @@ def translate_nminus1_for_powsybl(
         # The Powsybl contingency analysis has no SPPS support and never reads the rules.
         logger.warning("powsybl_spps_rules_ignored", n_spps_rules=len(nminus1_definition.spps_rules))
     translated_nminus1 = translate_nminus1_components_for_powsybl(nminus1_definition, net)
+    monitored = translated_nminus1.monitored_elements
     translated_branch_limits = resolve_branch_limits_for_powsybl(
         net=net,
-        monitored_branches=translated_nminus1.monitored_elements["branches"],
+        monitored_branches=[*monitored["branches"], *monitored["trafo3w"]],
         branch_limit_cache=branch_limit_cache,
     )
     return PowsyblNMinus1Definition.model_validate(
