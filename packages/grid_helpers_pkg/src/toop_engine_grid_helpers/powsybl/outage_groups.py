@@ -23,8 +23,8 @@ import numpy as np
 import pandas as pd
 from pypowsybl.network import Network
 
+# Connectable types whose terminals belong to one outage group
 PROPAGATING_CONNECTABLE_TYPES = ("LINE", "TWO_WINDINGS_TRANSFORMER", "THREE_WINDINGS_TRANSFORMER", "TIE_LINE")
-"""Connectable types whose terminals belong to one outage group."""
 
 
 @dataclass
@@ -66,10 +66,11 @@ def get_node_breaker_graph(network: Network) -> NodeBreakerGraph:
     for voltage_level_id in node_breaker_levels:
         topology = network.get_node_breaker_topology(voltage_level_id)
         nodes = topology.nodes
+        # A voltage level without anything in it has no nodes
         n_nodes = (
             int(
                 max(
-                    nodes.index.max(),
+                    nodes.index.max() if len(nodes) else -1,
                     topology.switches[["node1", "node2"]].to_numpy().max(initial=-1),
                     topology.internal_connections[["node1", "node2"]].to_numpy().max(initial=-1),
                 )
@@ -94,13 +95,20 @@ def get_node_breaker_graph(network: Network) -> NodeBreakerGraph:
 
     switches = network.get_switches(attributes=["kind", "open", "voltage_level_id", "node1", "node2"])
     switches = switches[switches["voltage_level_id"].isin(offsets)].copy()
-    shift = switches["voltage_level_id"].map(offsets).to_numpy()
-    switches["node1"] = switches["node1"].to_numpy() + shift
-    switches["node2"] = switches["node2"].to_numpy() + shift
+    # Explicit integers: without any node-breaker voltage level the columns are empty and have no integer type
+    shift = switches["voltage_level_id"].map(offsets).to_numpy(dtype=np.int64)
+    switches["node1"] = switches["node1"].to_numpy(dtype=np.int64) + shift
+    switches["node2"] = switches["node2"].to_numpy(dtype=np.int64) + shift
     terminals = (
         pd.concat(terminal_frames, ignore_index=True)
         if terminal_frames
-        else pd.DataFrame(columns=["connectable_id", "connectable_type", "node"])
+        else pd.DataFrame(
+            {
+                "connectable_id": pd.Series(dtype=object),
+                "connectable_type": pd.Series(dtype=object),
+                "node": pd.Series(dtype=np.int64),
+            }
+        )
     )
     connections = np.concatenate(connection_frames) if connection_frames else np.empty((0, 2), dtype=int)
     node_voltage_level = pd.Series(np.concatenate(level_of_node) if level_of_node else np.array([], dtype=object))
@@ -189,10 +197,10 @@ def get_outage_groups(
     first_node = terminals.drop_duplicates("connectable_id").set_index("connectable_id")["node"]
     requested = pd.Index(list(dict.fromkeys(element_ids)))
     on_nodes = requested[requested.isin(first_node.index)]
-    group_of_element = dict(zip(on_nodes, labels[first_node.loc[on_nodes].to_numpy()].tolist(), strict=True))
+    group_of_element = dict(zip(on_nodes, labels[first_node.loc[on_nodes].to_numpy(dtype=np.int64)].tolist(), strict=True))
 
     groups = sorted(set(group_of_element.values()))
-    terminal_groups = labels[terminals["node"].to_numpy()]
+    terminal_groups = labels[terminals["node"].to_numpy(dtype=np.int64)]
     in_groups = np.isin(terminal_groups, groups)
     elements = (
         pd.DataFrame(

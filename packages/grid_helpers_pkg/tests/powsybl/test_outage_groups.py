@@ -82,3 +82,20 @@ def test_outage_lists_breakers_then_elements(network: pypowsybl.network.Network)
     assert ids[: len(breakers)] == sorted(breakers)
     assert {"LINE_S3S4", "LD1"} <= set(ids)
     assert np.array_equal(np.sort(groups.nodes[group_ids[0]]), groups.nodes[group_ids[0]])
+
+
+def test_network_without_node_breaker_voltage_levels_has_no_groups() -> None:
+    network = pypowsybl.network.create_ieee14()
+
+    assert get_node_breaker_graph(network).n_nodes == 0
+    assert get_outage_groups(network, ["L1-2-1"]).group_of_element == {}
+    assert get_outage_groups(network, []).group_of_element == {}
+
+
+def test_voltage_level_without_nodes_is_skipped(network: pypowsybl.network.Network) -> None:
+    n_nodes = get_node_breaker_graph(network).n_nodes
+    network.create_voltage_levels(id="EMPTY", substation_id="S1", topology_kind="NODE_BREAKER", nominal_v=110)
+
+    assert get_node_breaker_graph(network).n_nodes == n_nodes
+    groups = get_outage_groups(network, ["LINE_S2S3"])
+    assert "LINE_S2S3" in groups.elements[groups.group_of_element["LINE_S2S3"]]
