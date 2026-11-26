@@ -191,10 +191,11 @@ def test_run_powsybl_analysis_reports_contingency_voltage_levels(
     result, _ = run_powsybl_analysis(powsybl_bus_breaker_net, pow_n1_def, security_params, "ac")
 
     buses = result.bus_results.reset_index()
-    assert set(buses.loc[buses["voltage_level_id"] == extra, "contingency_id"]) == {chosen}
+    # the base case reports it as well: the voltage deviation of the contingency is read against it
+    assert set(buses.loc[buses["voltage_level_id"] == extra, "contingency_id"]) == {"", chosen}
     # everything else is reported as without the extra voltage level, also in the chosen contingency
     expected = reference_buses[
-        (reference_buses["voltage_level_id"] != extra) | (reference_buses["contingency_id"] == chosen)
+        (reference_buses["voltage_level_id"] != extra) | reference_buses["contingency_id"].isin(["", chosen])
     ]
     columns = ["contingency_id", "voltage_level_id", "bus_id"]
     pd.testing.assert_frame_equal(

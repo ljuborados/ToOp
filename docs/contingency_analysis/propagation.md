@@ -30,10 +30,13 @@ connected through them only is tripped as well. Every production path runs like 
 loadflow and the artificial limits), the AC optimizer and the AC loadflow service.
 
 A contingency whose isolation changes nothing, e.g. the outage of a busbar section nothing is connected to, gets no
-result from powsybl. It is `NO_CALCULATION` in the convergence table, in both runners.
+result from powsybl. It is `NO_CALCULATION` in the convergence table, in both runners. The monitored element runner
+can give it the base case values instead, see
+[contingencies without a result of powsybl](islands_and_slack.md#contingencies-without-a-result-of-powsybl).
 
 The elements powsybl tripped are listed per contingency in the connectivity result, see
-[connectivity](limit_table.md#connectivity).
+[connectivity](limit_table.md#connectivity). A contingency the monitored element runner solves with its own load flow
+is listed there as well, see [islands and slack](islands_and_slack.md#contingencies-solved-with-their-own-load-flow).
 
 With the propagation, powsybl reports the voltages of node-breaker voltage levels at their busbar sections only. The
 voltage angle differences of the outaged branches and the monitored switches are therefore read at the busbar section

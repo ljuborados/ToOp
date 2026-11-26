@@ -20,7 +20,7 @@ not change the network. The helpers here fill those gaps on the raw result frame
 import uuid
 from collections.abc import Collection, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 import polars as pl
@@ -274,16 +274,25 @@ def contingencies_touching_non_main_components(
     """Contingencies with an element in a synchronous component other than the main one.
 
     The security analysis cannot solve those components, so these contingencies need their own load flow. A switch
-    counts as touching every component of its voltage level.
+    counts as touching every component of its voltage level, an HVDC line the components of its converter stations
+    and a tie line those of its dangling lines.
     """
     switch_voltage_levels = net.get_switches(attributes=["voltage_level_id"])["voltage_level_id"].to_dict()
+    wanted = {element for elements in contingencies.values() for element in elements}
+    parts = _element_parts(net, wanted)
     touching = set()
     for contingency_id, elements in contingencies.items():
         for element in elements:
             element_components: set[int] = set()
-            for mapping in (components.branch, components.three_windings_transformer, components.injection):
-                if element in mapping:
-                    element_components.add(mapping[element])
+            for part in parts.get(element, [element]):
+                for mapping in (
+                    components.branch,
+                    components.three_windings_transformer,
+                    components.injection,
+                    components.bus,
+                ):
+                    if part in mapping:
+                        element_components.add(mapping[part])
             if element in switch_voltage_levels:
                 element_components |= components.voltage_level.get(str(switch_voltage_levels[element]), set())
             if any(components.is_non_main(component) for component in element_components):
@@ -318,21 +327,61 @@ class _OutageElements:
     types: pd.Series
     """Identifiable id -> type."""
     parts: dict[str, list[str]]
-    """HVDC line or tie line id -> the connectables that are disconnected for it."""
+    """HVDC line, tie line or bus breaker bus id -> the connectables that are disconnected for it."""
     voltage_levels: dict[str, set[str]]
     """Contingency element id -> its voltage levels."""
+    node_breaker_levels: set[str]
+    """The voltage levels in node-breaker topology."""
+    bus_terminals: dict[str, list[tuple[str, int | None]]] = field(default_factory=dict)
+    """Bus breaker bus id -> what is connected to it, see ``_bus_terminals``."""
 
 
-def _outage_elements(net: Network, element_ids: Collection[str]) -> _OutageElements:
-    types = net.get_identifiables(attributes=["type"])["type"]
+def _element_parts(net: Network, element_ids: Collection[str]) -> dict[str, list[str]]:
+    """Return the connectables that stand for the elements that are no connectable themselves.
+
+    An HVDC line goes out with both converter stations and a tie line with both dangling lines.
+    """
+    wanted = list(element_ids)
     parts: dict[str, list[str]] = {}
     hvdc_lines = net.get_hvdc_lines(attributes=["converter_station1_id", "converter_station2_id"])
     tie_lines = net.get_tie_lines(attributes=["dangling_line1_id", "dangling_line2_id"])
     for frame in (hvdc_lines, tie_lines):
-        for element in frame.index.intersection(list(element_ids)):
+        for element in frame.index.intersection(wanted):
             parts[str(element)] = [str(part) for part in frame.loc[element]]
+    return parts
+
+
+def _bus_terminals(net: Network, element_ids: Collection[str]) -> dict[str, list[tuple[str, int | None]]]:
+    """Return what is connected to the bus breaker buses among *element_ids*: (connectable, side).
+
+    The side is None for an injection. Busbar sections are left out.
+    """
+    buses = net.get_bus_breaker_view_buses(attributes=[]).index.intersection(list(element_ids))
+    if not len(buses):
+        return {}
+    terminals: dict[str, list[tuple[str, int | None]]] = {str(bus): [] for bus in buses}
+    injections = net.get_injections(attributes=["type", "bus_breaker_bus_id"]).query("type != 'BUSBAR_SECTION'")
+    branches = net.get_branches(attributes=["bus_breaker_bus1_id", "bus_breaker_bus2_id"])
+    transformers = net.get_3_windings_transformers(
+        attributes=["bus_breaker_bus1_id", "bus_breaker_bus2_id", "bus_breaker_bus3_id"]
+    )
+    columns = [(injections, None, "bus_breaker_bus_id")]
+    columns += [(branches, side, f"bus_breaker_bus{side}_id") for side in (1, 2)]
+    columns += [(transformers, side, f"bus_breaker_bus{side}_id") for side in (1, 2, 3)]
+    for frame, side, column in columns:
+        connected = frame[frame[column].isin(terminals)]
+        for connectable, bus in zip(connected.index, connected[column], strict=True):
+            terminals[str(bus)].append((str(connectable), side))
+    return terminals
+
+
+def _outage_elements(net: Network, element_ids: Collection[str]) -> _OutageElements:
+    types = net.get_identifiables(attributes=["type"])["type"]
+    parts = _element_parts(net, element_ids)
+    bus_terminals = _bus_terminals(net, element_ids)
 
     wanted = {*element_ids, *(part for element_parts in parts.values() for part in element_parts)}
+    wanted |= {connectable for terminals in bus_terminals.values() for connectable, _ in terminals}
     voltage_levels: dict[str, set[str]] = {}
     frames = (
         net.get_branches(attributes=["voltage_level1_id", "voltage_level2_id"]),
@@ -340,14 +389,19 @@ def _outage_elements(net: Network, element_ids: Collection[str]) -> _OutageEleme
         net.get_injections(attributes=["voltage_level_id"]),
         net.get_busbar_sections(attributes=["voltage_level_id"]),
         net.get_switches(attributes=["voltage_level_id"]),
+        net.get_bus_breaker_view_buses(attributes=["voltage_level_id"]),
     )
     for frame in frames:
         rows = frame[frame.index.isin(list(wanted))]
         for element, row in zip(rows.index, rows.to_numpy(), strict=True):
             voltage_levels.setdefault(str(element), set()).update(str(level) for level in row)
     for element, element_parts in parts.items():
-        voltage_levels[element] = set().union(*(voltage_levels.get(part, set()) for part in element_parts))
-    return _OutageElements(types, parts, voltage_levels)
+        voltage_levels[element] = voltage_levels.get(element, set()).union(
+            *(voltage_levels.get(part, set()) for part in element_parts)
+        )
+    topology_kinds = net.get_voltage_levels(attributes=["topology_kind"])["topology_kind"]
+    node_breaker_levels = set(topology_kinds.index[topology_kinds == "NODE_BREAKER"].astype(str))
+    return _OutageElements(types, parts, voltage_levels, node_breaker_levels, bus_terminals)
 
 
 def _has_bus(net: Network, element: str, element_type: str | None) -> bool:
@@ -363,24 +417,84 @@ def _has_bus(net: Network, element: str, element_type: str | None) -> bool:
     return bool((frame.fillna("") != "").to_numpy().any())
 
 
-def _disconnect(net: Network, element: str, element_type: str | None) -> bool:
+def _open_switches_at(net: Network, element: str, outage_elements: _OutageElements) -> bool:
+    """Open every closed switch at the nodes of *element*, whatever its kind; False if it has no such node.
+
+    This takes the element out where powsybl finds no circuit breaker to open for it: behind a fictitious breaker,
+    or connected through disconnectors alone.
+    """
+    to_open: list[str] = []
+    found = False
+    for voltage_level in outage_elements.voltage_levels.get(element, set()) & outage_elements.node_breaker_levels:
+        topology = net.get_node_breaker_topology(voltage_level)
+        nodes = set(topology.nodes.index[topology.nodes["connectable_id"] == element].astype(int))
+        if not nodes:
+            continue
+        found = True
+        # Nodes joined by an internal connection are one node
+        connections = topology.internal_connections[["node1", "node2"]].to_numpy()
+        grown = True
+        while grown:
+            joined = {int(node) for pair in connections if set(pair) & nodes for node in pair}
+            grown = not joined <= nodes
+            nodes |= joined
+        switches = topology.switches
+        at_nodes = (switches["node1"].isin(nodes) | switches["node2"].isin(nodes)) & ~switches["open"]
+        to_open += switches.index[at_nodes].astype(str).to_list()
+    if to_open:
+        net.update_switches(pd.DataFrame({"open": True}, index=pd.Index(to_open, name="id")))
+    return found
+
+
+def _disconnect(net: Network, element: str, outage_elements: _OutageElements) -> bool:
     """Disconnect a connectable; an element that is off already counts as disconnected."""
+    element_type = outage_elements.types.get(element)
     try:
         if net.disconnect(element):
             return True
         # powsybl returns False as well for an element that is dead already, for instance one the breakers of the
         # same contingency have just isolated
-        return not _has_bus(net, element, element_type)
+        if not _has_bus(net, element, element_type):
+            return True
+        return _open_switches_at(net, element, outage_elements) and not _has_bus(net, element, element_type)
     except pypowsybl.PyPowsyblError as error:
         logger.warning("powsybl_outage_not_applied", element=element, error=str(error))
         return False
+
+
+_SIDE_UPDATES = {
+    "LINE": "update_lines",
+    "TWO_WINDINGS_TRANSFORMER": "update_2_windings_transformers",
+    "THREE_WINDINGS_TRANSFORMER": "update_3_windings_transformers",
+}
+
+
+def _disconnect_from_bus(net: Network, bus_element: str, outage_elements: _OutageElements) -> bool:
+    """Take everything off a bus breaker bus, as the security analysis loses a bus.
+
+    Injections go out, branches and transformers only on the side that is on the bus.
+    """
+    applied = True
+    for connectable, side in outage_elements.bus_terminals.get(bus_element, []):
+        update = _SIDE_UPDATES.get(outage_elements.types.get(connectable))
+        if side is None or update is None:
+            applied &= _disconnect(net, connectable, outage_elements)
+            continue
+        try:
+            getattr(net, update)(pd.DataFrame({f"connected{side}": False}, index=pd.Index([connectable], name="id")))
+        except pypowsybl.PyPowsyblError as error:
+            logger.warning("powsybl_outage_not_applied", element=connectable, error=str(error))
+            applied = False
+    return applied
 
 
 def _apply_outage(net: Network, elements: Sequence[str], outage_elements: _OutageElements) -> bool:
     """Open the switches and disconnect the other elements of a contingency on the working variant.
 
     An HVDC line goes out with both converter stations and a tie line with both dangling lines, as neither is a
-    connectable itself. Returns False when an element could not be disconnected.
+    connectable itself. A bus breaker bus loses everything on it. A busbar section goes out with the circuit breakers
+    around it, whatever the contingency propagation of the security analysis is set to. Returns False when an element
+    could not be disconnected.
     """
     types = outage_elements.types
     switches = [element for element in elements if types.get(element) == "SWITCH"]
@@ -390,8 +504,14 @@ def _apply_outage(net: Network, elements: Sequence[str], outage_elements: _Outag
     for element in elements:
         if element in switches:
             continue
+        element_type = types.get(element)
+        if element_type == "BUS":
+            if not _disconnect_from_bus(net, element, outage_elements):
+                applied = False
+                logger.warning("powsybl_outage_not_applied", element=element)
+            continue
         for part in outage_elements.parts.get(element, [element]):
-            if not _disconnect(net, part, types.get(part)):
+            if not _disconnect(net, part, outage_elements):
                 applied = False
                 logger.warning("powsybl_outage_not_applied", element=element)
     return applied
@@ -401,18 +521,27 @@ def resolve_slack_buses(net: Network, slack_ids: Sequence[str]) -> list[str]:
     """Bus view ids for slack ids on the working variant.
 
     An injection id (e.g. the slack generator) stands for the bus it is connected to, so the slack follows the
-    generator when an outage renumbers the buses. Any other id is taken as a bus id. Disconnected injections are left
-    out.
+    generator when an outage renumbers the buses. A bus breaker bus stands for the bus it is part of, and a bus view
+    id for itself. Disconnected injections and ids that are none of these are left out, with a warning.
     """
     injection_buses = net.get_injections(attributes=["bus_id"])["bus_id"]
-    resolved = []
+    bus_breaker_buses = net.get_bus_breaker_view_buses(attributes=["bus_id"])["bus_id"]
+    bus_ids = set(net.get_buses(attributes=[]).index)
+    resolved, unresolved = [], []
     for slack_id in slack_ids:
-        bus_id = injection_buses.get(slack_id, slack_id)
-        if bus_id:
-            resolved.append(str(bus_id))
-    if slack_ids and not resolved:
+        if slack_id in injection_buses.index:
+            bus_id = injection_buses[slack_id]
+        elif slack_id in bus_breaker_buses.index:
+            bus_id = bus_breaker_buses[slack_id]
+        else:
+            bus_id = slack_id if slack_id in bus_ids else ""
+        if isinstance(bus_id, str) and bus_id:
+            resolved.append(bus_id)
+        else:
+            unresolved.append(slack_id)
+    if unresolved:
         # Without a slack to name the load flow parameters decide, which is not what was asked for
-        logger.warning("powsybl_slack_override_not_connected", slack_ids=list(slack_ids))
+        logger.warning("powsybl_slack_override_not_connected", slack_ids=unresolved)
     return list(dict.fromkeys(resolved))
 
 
@@ -490,7 +619,13 @@ def _collect_raw_rows(
         bus_columns = [column for column in frame.columns if column.startswith("bus") and column.endswith("_id")]
         unsolved = ~frame[bus_columns].isin(solved_buses).any(axis=1)
         # The security analysis reports no row for a branch it did not solve (tripped or in a dropped island)
-        frame = frame[~unsolved & frame[columns].notna().any(axis=1)]
+        frame = frame[~unsolved & frame[columns].notna().any(axis=1)].copy()
+        # A side that is off while another one is solved carries nothing, which the security analysis reports as 0
+        for bus_column in bus_columns:
+            side = bus_column.removeprefix("bus").removesuffix("_id")
+            off = frame[bus_column].fillna("") == ""
+            side_columns = [column for column in columns if column.endswith(side)]
+            frame.loc[off, side_columns] = frame.loc[off, side_columns].fillna(0.0)
         data = {"contingency_id": contingency_id, id_column: frame.index.astype(str).to_list()}
         if "operator_strategy_id" in schema:
             data["operator_strategy_id"] = ""
@@ -557,6 +692,16 @@ def basecase_bus_rows(
         net.remove_variant(variant)
 
 
+def _elements_on_a_bus(net: Network) -> set[str]:
+    """Return the branches, three winding transformers and injections with a side on a bus of the working variant."""
+    frames = (
+        net.get_branches(attributes=["bus1_id", "bus2_id"]),
+        net.get_3_windings_transformers(attributes=["bus1_id", "bus2_id", "bus3_id"]),
+        net.get_injections(attributes=["bus_id"]),
+    )
+    return {str(element) for frame in frames for element in frame.index[(frame.fillna("") != "").any(axis=1)]}
+
+
 def run_contingencies_as_loadflows(
     net: Network,
     contingencies: Mapping[str, Sequence[str]],
@@ -566,7 +711,7 @@ def run_contingencies_as_loadflows(
     monitored_voltage_levels: Collection[str],
     slack_bus_overrides: Mapping[str, Sequence[str]] | None = None,
     contingency_voltage_levels: Mapping[str, Collection[str]] | None = None,
-) -> tuple[RawSecurityResults, dict[str, ComponentStatus]]:
+) -> tuple[RawSecurityResults, dict[str, ComponentStatus], dict[str, list[str]]]:
     """Solve each contingency with its own AC load flow over every island.
 
     Each contingency is applied on a fresh variant of the working variant, which is left unchanged. Unlike the security
@@ -590,17 +735,20 @@ def run_contingencies_as_loadflows(
 
     Returns
     -------
-    tuple[RawSecurityResults, dict[str, ComponentStatus]]
-        The raw rows of the converged contingencies and the status of every contingency. The status is the worst of
-        the islands the contingency is judged by (see ``_components_to_judge``); an island that does not converge
-        has no rows.
+    tuple[RawSecurityResults, dict[str, ComponentStatus], dict[str, list[str]]]
+        The raw rows of the converged contingencies, the status of every contingency and the elements every applied
+        contingency disconnected: its own and the ones that lost their bus with them. The status is the worst of the
+        islands the contingency is judged by (see ``_components_to_judge``); an island that does not converge has no
+        rows.
     """
     slack_bus_overrides = slack_bus_overrides or {}
     contingency_voltage_levels = contingency_voltage_levels or {}
     base_variant = net.get_working_variant_id()
     outage_elements = _outage_elements(net, {element for elements in contingencies.values() for element in elements})
+    on_a_bus = _elements_on_a_bus(net)
     results = []
     statuses: dict[str, ComponentStatus] = {}
+    disconnected: dict[str, list[str]] = {}
     for contingency_id, elements in contingencies.items():
         variant = f"outage-{uuid.uuid4()}"
         net.clone_variant(base_variant, variant)
@@ -609,6 +757,7 @@ def run_contingencies_as_loadflows(
             if not _apply_outage(net, elements, outage_elements):
                 statuses[contingency_id] = ComponentStatus.FAILED
                 continue
+            disconnected[contingency_id] = sorted({*elements, *(on_a_bus - _elements_on_a_bus(net))})
             slack_ids = slack_bus_overrides.get(contingency_id)
             slack_bus_ids = resolve_slack_buses(net, slack_ids) if slack_ids else None
             component_results = pypowsybl.loadflow.run_ac(
@@ -636,4 +785,4 @@ def run_contingencies_as_loadflows(
         finally:
             net.set_working_variant(base_variant)
             net.remove_variant(variant)
-    return concat_raw_results(results), statuses
+    return concat_raw_results(results), statuses, disconnected

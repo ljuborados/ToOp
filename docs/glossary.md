@@ -126,6 +126,16 @@ to the same outage group.
 - **Code:** `outage_group_id`, `element_outage_group_id` (loadflow results), `apply_outage_grouping`.
 - **See:** [Contingency propagation](contingency_analysis/propagation.md).
 
+### Synchronous component / island
+
+A part of the grid whose buses are connected through AC branches. Two synchronous components can still exchange power
+over an HVDC link, but each has its own frequency, slack and voltage angle reference. The main one is the largest;
+OpenLoadFlow's security analysis solves only that one.
+
+- **Code:** `SynchronousComponents`, `get_synchronous_components`, `fill_non_main_components`; powsybl bus attribute `synchronous_component`.
+- **Prefer:** *synchronous component* in code and docstrings, *island* as the short form in prose.
+- **See:** [Islands and slack](contingency_analysis/islands_and_slack.md).
+
 ### Busbar outage
 
 The outage of a physical busbar. It propagates over closed non-breaker couplers and is then expressed as branch outages plus

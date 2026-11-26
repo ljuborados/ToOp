@@ -557,6 +557,9 @@ def get_blank_va_diff(
         For all of these cases, the specific outaged branch need to be checked.
     monitored_switches : list[str]
         The list of monitored switches to be considered. These are only the switches that are open and retained.
+    basecase_id : Optional[str]
+        The id of the declared base case. Other contingencies without elements are then reported with the base case
+        values, so they get the rows of the monitored switches as well.
 
     Returns
     -------
@@ -596,6 +599,7 @@ def get_blank_va_diff_with_buses(
     switches: pd.DataFrame,
     pow_contingencies: list[PowsyblContingency],
     monitored_switches: list[str],
+    basecase_id: Optional[str] = None,
 ) -> pd.DataFrame:
     """Get a blank dataframe for the voltage angle difference results with the buspairs that need checking.
 
@@ -612,6 +616,9 @@ def get_blank_va_diff_with_buses(
         For single outages we also consider the outaged branches.
     monitored_switches : list[str]
         The list of monitored switches to be considered. These are only the switches that are open and retained.
+    basecase_id : Optional[str]
+        The id of the declared base case. Other contingencies without elements are then reported with the base case
+        values, so they get the rows of the monitored switches as well.
 
     Returns
     -------
@@ -637,7 +644,11 @@ def get_blank_va_diff_with_buses(
         ["bus_breaker_bus1_id", "bus_breaker_bus2_id"]
     ]
     element_df = pd.concat([branches, switches], axis=0)
-    all_outage_ids = [contingency.id for contingency in pow_contingencies if len(contingency.elements) > 0]
+    all_outage_ids = [
+        contingency.id
+        for contingency in pow_contingencies
+        if len(contingency.elements) > 0 or (basecase_id is not None and contingency.id != basecase_id)
+    ]
     blank_va_diff = get_blank_va_diff(all_outage_ids, single_branch_outages, switches.index.tolist())
 
     va_diff_with_buses = blank_va_diff.merge(
@@ -666,7 +677,9 @@ def get_blank_va_diff_with_buses(
     return va_diff_with_buses
 
 
-def get_busbar_bus_breaker_buses(net: Network, bus_breaker_bus_ids: Sequence[str]) -> dict[str, str]:
+def get_busbar_bus_breaker_buses(
+    net: Network, bus_breaker_bus_ids: Sequence[str], open_switches: Collection[str] = ()
+) -> dict[str, str]:
     """Map bus-breaker buses of node-breaker voltage levels to the bus of the busbar section they are connected to.
 
     With the contingency propagation of powsybl, the security analysis reports the voltages of node-breaker voltage
@@ -684,6 +697,9 @@ def get_busbar_bus_breaker_buses(net: Network, bus_breaker_bus_ids: Sequence[str
         The network in the topology the security analysis runs on.
     bus_breaker_bus_ids : Sequence[str]
         The bus-breaker buses to map, e.g. the ends of the outaged branches and the sides of the monitored switches.
+    open_switches : Collection[str]
+        Switches to take as open, e.g. a monitored switch its contingency opens: the angle across it is the one between
+        the busbar sections its two sides are still connected to without it.
 
     Returns
     -------
@@ -701,7 +717,7 @@ def get_busbar_bus_breaker_buses(net: Network, bus_breaker_bus_ids: Sequence[str
         busbar_bus_ids = set(topology.elements.query("type == 'BUSBAR_SECTION'")["bus_id"].astype(str))
         if not busbar_bus_ids:
             continue
-        closed = topology.switches[~topology.switches["open"]]
+        closed = topology.switches[~topology.switches["open"] & ~topology.switches.index.isin(list(open_switches))]
         graph = nx.Graph()
         graph.add_nodes_from(topology.buses.index.astype(str))
         graph.add_edges_from(zip(closed["bus1_id"].astype(str), closed["bus2_id"].astype(str), strict=True))
@@ -980,12 +996,43 @@ def translate_nminus1_components_for_powsybl(
         nminus1_definition, all_branches, busmap, switches
     )
 
-    va_diff_with_buses = get_blank_va_diff_with_buses(branches, switches, pow_contingencies, monitored_elements["switches"])
+    base_case = nminus1_definition.base_case
+    va_diff_with_buses = get_blank_va_diff_with_buses(
+        branches,
+        switches,
+        pow_contingencies,
+        monitored_elements["switches"],
+        basecase_id=base_case.id if base_case is not None else None,
+    )
     # The voltage angles of node-breaker voltage levels are read at their busbar sections, see get_busbar_bus_breaker_buses
     bus_columns = ["bus_breaker_bus1_id", "bus_breaker_bus2_id"]
-    busbar_buses = get_busbar_bus_breaker_buses(net, va_diff_with_buses[bus_columns].stack().astype(str).tolist())
-    va_diff_with_buses[bus_columns] = va_diff_with_buses[bus_columns].apply(lambda column: column.replace(busbar_buses))
-    base_case = nminus1_definition.base_case
+    # A switch its own contingency opens no longer joins its two sides: each side is mapped without it
+    outaged_elements = {contingency.id: set(contingency.elements) for contingency in pow_contingencies}
+    rows = va_diff_with_buses.index
+    opened = pd.Series(
+        [
+            element in switches.index and element in outaged_elements.get(contingency, ())
+            for contingency, element in zip(
+                rows.get_level_values("contingency"), rows.get_level_values("element"), strict=True
+            )
+        ],
+        index=rows,
+        dtype=bool,
+    )
+    busbar_buses = get_busbar_bus_breaker_buses(
+        net, va_diff_with_buses.loc[~opened, bus_columns].stack().astype(str).tolist()
+    )
+    va_diff_with_buses.loc[~opened, bus_columns] = va_diff_with_buses.loc[~opened, bus_columns].apply(
+        lambda column: column.replace(busbar_buses)
+    )
+    for switch_id in sorted(set(rows.get_level_values("element")[opened.to_numpy()])):
+        of_switch = (opened & (rows.get_level_values("element") == switch_id)).to_numpy()
+        buses_without_it = get_busbar_bus_breaker_buses(
+            net, va_diff_with_buses.loc[of_switch, bus_columns].stack().astype(str).tolist(), open_switches=[switch_id]
+        )
+        va_diff_with_buses.loc[of_switch, bus_columns] = va_diff_with_buses.loc[of_switch, bus_columns].apply(
+            lambda column, mapping=buses_without_it: column.replace(mapping)
+        )
     return PowsyblNMinus1Definition(
         basecase_id=base_case.id if base_case is not None else None,
         contingencies=pow_contingencies,
